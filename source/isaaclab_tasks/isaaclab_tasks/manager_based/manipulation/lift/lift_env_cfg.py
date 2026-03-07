@@ -5,6 +5,7 @@
 
 from dataclasses import MISSING
 
+from isaaclab_newton.physics import MJWarpSolverCfg, NewtonCfg
 from isaaclab_physx.assets import DeformableObjectCfg
 from isaaclab_physx.physics import PhysxCfg
 
@@ -24,11 +25,43 @@ from isaaclab.sim.spawners.from_files.from_files_cfg import GroundPlaneCfg, UsdF
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
+from isaaclab_tasks.utils import PresetCfg
+
 from . import mdp
 
 ##
 # Scene definition
 ##
+
+
+@configclass
+class LiftPhysicsCfg(PresetCfg):
+    """Physics preset options for lift tasks.
+
+    The Newton preset is tuned for stable arm + object contact dynamics while
+    keeping solver cost moderate for multi-env training.
+    """
+
+    default: PhysxCfg = PhysxCfg(
+        bounce_threshold_velocity=0.01,
+        gpu_found_lost_aggregate_pairs_capacity=1024 * 1024 * 4,
+        gpu_total_aggregate_pairs_capacity=16 * 1024,
+        friction_correlation_distance=0.00625,
+    )
+    physx: PhysxCfg = default
+    newton: NewtonCfg = NewtonCfg(
+        solver_cfg=MJWarpSolverCfg(
+            njmax=256,
+            nconmax=64,
+            ls_iterations=20,
+            cone="pyramidal",
+            ls_parallel=True,
+            integrator="implicitfast",
+            impratio=1.0,
+        ),
+        num_substeps=1,
+        debug_mode=False,
+    )
 
 
 @configclass
@@ -217,10 +250,4 @@ class LiftEnvCfg(ManagerBasedRLEnvCfg):
         # simulation settings
         self.sim.dt = 0.01  # 100Hz
         self.sim.render_interval = self.decimation
-
-        self.sim.physics = PhysxCfg(
-            bounce_threshold_velocity=0.01,
-            gpu_found_lost_aggregate_pairs_capacity=1024 * 1024 * 4,
-            gpu_total_aggregate_pairs_capacity=16 * 1024,
-            friction_correlation_distance=0.00625,
-        )
+        self.sim.physics = LiftPhysicsCfg()
