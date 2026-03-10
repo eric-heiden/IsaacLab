@@ -20,24 +20,24 @@ class FrankaCubeNewtonContactCfg:
     """Task-local Newton contact tuning for the template Franka cube env."""
 
     enabled: bool = True
-    ke: float | None = 250_000.0
-    kd: float | None = 5_000.0
-    kf: float | None = 10_000.0
-    mu: float | None = 1.25
-    contact_margin: float | None = 0.005
-    geom_solimp: tuple[float, float, float, float, float] | None = (0.985, 0.999, 0.0015, 0.5, 3.0)
-    solimp_friction: tuple[float, float, float, float, float] | None = (0.985, 0.999, 0.0015, 0.5, 3.0)
-    solref_friction: tuple[float, float] | None = (0.005, 4.0)
-    support_pair_solimp: tuple[float, float, float, float, float] | None = (0.992, 0.999, 0.0015, 0.5, 3.0)
-    support_pair_solref: tuple[float, float] | None = (0.006, 5.0)
-    support_pair_friction: tuple[float, float, float, float, float] | None = (1.5, 1.5, 0.02, 0.002, 0.002)
-    support_pair_margin: float | None = 0.003
-    support_pair_condim: int | None = 6
-    grasp_pair_solimp: tuple[float, float, float, float, float] | None = (0.995, 0.9995, 0.001, 0.5, 3.0)
-    grasp_pair_solref: tuple[float, float] | None = (0.003, 5.0)
-    grasp_pair_friction: tuple[float, float, float, float, float] | None = (2.0, 2.0, 0.02, 0.002, 0.002)
-    grasp_pair_margin: float | None = 0.004
-    grasp_pair_condim: int | None = 6
+    ke: float | None = 100_000.0
+    kd: float | None = 1_000.0
+    kf: float | None = 3_000.0
+    mu: float | None = 1.0
+    contact_margin: float | None = 0.003
+    geom_solimp: tuple[float, float, float, float, float] | None = (0.95, 0.99, 0.002, 0.5, 2.0)
+    solimp_friction: tuple[float, float, float, float, float] | None = (0.95, 0.99, 0.002, 0.5, 2.0)
+    solref_friction: tuple[float, float] | None = (0.01, 2.0)
+    support_pair_solimp: tuple[float, float, float, float, float] | None = (0.985, 0.999, 0.0015, 0.5, 3.0)
+    support_pair_solref: tuple[float, float] | None = (0.008, 3.0)
+    support_pair_friction: tuple[float, float, float, float, float] | None = (0.35, 0.35, 0.001, 0.0001, 0.0001)
+    support_pair_margin: float | None = 0.001
+    support_pair_condim: int | None = 3
+    grasp_pair_solimp: tuple[float, float, float, float, float] | None = (0.97, 0.995, 0.0015, 0.5, 2.0)
+    grasp_pair_solref: tuple[float, float] | None = (0.008, 2.0)
+    grasp_pair_friction: tuple[float, float, float, float, float] | None = (1.25, 1.25, 0.01, 0.001, 0.001)
+    grasp_pair_margin: float | None = 0.002
+    grasp_pair_condim: int | None = 4
 
 
 @configclass
@@ -55,7 +55,7 @@ class FrankaCubeEnvCfg(DirectRLEnvCfg):
         integrator="implicitfast",
         njmax=2000,
         nconmax=1000,
-        impratio=1000.0,
+        impratio=100.0,
         cone="elliptic",
         update_data_interval=2,
         iterations=20,
@@ -84,7 +84,7 @@ class FrankaCubeEnvCfg(DirectRLEnvCfg):
     # robot(s)
     robot_cfg: ArticulationCfg = FRANKA_PANDA_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     robot_cfg.spawn.rigid_props.disable_gravity = True
-    robot_cfg.spawn.rigid_props.max_depenetration_velocity = 8.0
+    robot_cfg.spawn.rigid_props.max_depenetration_velocity = 5.0
     robot_cfg.actuators["panda_shoulder"].velocity_limit_sim = 2.175
     robot_cfg.actuators["panda_shoulder"].stiffness = 400.0
     robot_cfg.actuators["panda_shoulder"].damping = 80.0
@@ -115,7 +115,7 @@ class FrankaCubeEnvCfg(DirectRLEnvCfg):
                 angular_damping=0.2,
                 max_angular_velocity=1000.0,
                 max_linear_velocity=1000.0,
-                max_depenetration_velocity=8.0,
+                max_depenetration_velocity=5.0,
                 disable_gravity=False,
             ),
             collision_props=sim_utils.CollisionPropertiesCfg(),
@@ -153,27 +153,31 @@ class FrankaCubeEnvCfg(DirectRLEnvCfg):
     # Reward scales
     reaching_object_scale = 1.0
     reaching_object_std = 0.1
-    pregrasp_reward_scale = 0.35
-    top_down_reward_scale = 0.15
-    gripper_open_reward_scale = 0.6
-    gripper_close_reward_scale = 2.5
-    grasp_reward_scale = 6.0
-    premature_close_penalty_scale = 0.75
-    close_stage_pose_reward_scale = 1.0
-    close_stage_open_penalty_scale = 1.0
-    lift_stage_hold_reward_scale = 0.5
-    close_stage_bonus_scale = 1.0
-    lift_stage_bonus_scale = 3.0
+    pregrasp_reward_scale = 0.0
+    top_down_reward_scale = 0.0
+    gripper_open_reward_scale = 0.2
+    approach_close_ready_reward_scale = 0.0
+    gripper_close_reward_scale = 0.0
+    grasp_reward_scale = 4.0
+    premature_close_penalty_scale = 0.0
+    close_stage_pose_reward_scale = 0.0
+    close_stage_enclosure_reward_scale = 0.0
+    close_stage_hold_reward_scale = 0.0
+    close_stage_open_penalty_scale = 0.0
+    lift_stage_hold_reward_scale = 0.0
+    close_stage_bonus_scale = 0.0
+    lift_stage_bonus_scale = 0.0
+    premature_lift_penalty_scale = 0.0
 
-    lifting_object_scale = 15.0
+    lifting_object_scale = 16.0
     lifting_object_min_height = 0.15
-    lift_progress_reward_scale = 18.0
-    lift_upward_velocity_reward_scale = 4.0
+    lift_progress_reward_scale = 8.0
+    lift_upward_velocity_reward_scale = 0.0
 
-    object_goal_tracking_scale = 16.0
+    object_goal_tracking_scale = 0.0
     object_goal_tracking_std = 0.3
 
-    object_goal_tracking_fine_scale = 5.0
+    object_goal_tracking_fine_scale = 0.0
     object_goal_tracking_fine_std = 0.05
 
     action_penalty_scale = 1e-4
@@ -194,11 +198,11 @@ class FrankaCubeEnvCfg(DirectRLEnvCfg):
     gripper_reward_sharpness = 40.0
     close_phase_gate_thresh = 0.2
     close_phase_sharpness = 20.0
-    approach_stage_reach_thresh = 0.05
-    approach_stage_pose_thresh = 0.15
-    approach_stage_enclosure_thresh = 0.45
+    approach_stage_reach_thresh = 0.06
+    approach_stage_pose_thresh = 0.1
+    approach_stage_enclosure_thresh = 0.3
     approach_stage_open_fraction_thresh = 0.75
-    lift_stage_secure_grasp_thresh = 0.1
+    lift_stage_secure_grasp_thresh = 0.2
     grasp_midpoint_std = 0.04
     grasp_balance_std = 0.02
     grasp_finger_height_std = 0.03
@@ -208,9 +212,10 @@ class FrankaCubeEnvCfg(DirectRLEnvCfg):
     enclosure_span_thresh = 0.05
     enclosure_span_sharpness = 60.0
     stalled_grasp_height = 0.02
-    stalled_grasp_penalty_scale = 1.5
+    stalled_grasp_penalty_scale = 0.0
     lift_progress_std = 0.03
     lift_upward_velocity_std = 0.05
+    premature_lift_velocity_std = 0.05
 
     # Termination conditions
     object_drop_height = -0.05  # Terminate if cube falls below this height

@@ -8,7 +8,6 @@ from __future__ import annotations
 import torch
 import warp as wp
 from collections.abc import Sequence
-from torch.nn import functional as F
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, RigidObject
@@ -236,6 +235,24 @@ class FrankaCubeEnv(DirectRLEnv):
         object_pos = self._get_object_pos()
         grasp_pos = self._get_grasp_pos()
         left_finger_pos, right_finger_pos = self._get_finger_positions()
+        finger_joint_pos = joint_pos[:, self.finger_joint_ids].mean(dim=-1)
+        (
+            finger_midpoint,
+            _grasp_pose_gate,
+            _close_phase_gate,
+            _gripper_close_reward,
+            _grasp_reward,
+            _secure_grasp_gate,
+            enclosure_gate,
+            _in_gripper_gate,
+            hold_gate,
+            finger_open_fraction,
+        ) = self._compute_grasp_metrics(
+            object_pos=object_pos,
+            left_finger_pos=left_finger_pos,
+            right_finger_pos=right_finger_pos,
+            finger_joint_pos=finger_joint_pos,
+        )
 
         obs = torch.cat(
             [
@@ -244,9 +261,11 @@ class FrankaCubeEnv(DirectRLEnv):
                 object_pos - grasp_pos,
                 object_pos - left_finger_pos,
                 object_pos - right_finger_pos,
-                self.goal_pos - object_pos,
+                object_pos - finger_midpoint,
                 self.previous_actions,
-                F.one_hot(self.reward_stage, num_classes=3).to(dtype=joint_pos.dtype),
+                finger_open_fraction.unsqueeze(-1),
+                enclosure_gate.unsqueeze(-1),
+                hold_gate.unsqueeze(-1),
             ],
             dim=-1,
         )
@@ -258,44 +277,32 @@ class FrankaCubeEnv(DirectRLEnv):
     def _get_rewards(self) -> torch.Tensor:
         self._enforce_arm_joint_velocity_limits()
         self._enforce_finger_joint_limits()
-        grasp_pos = self._get_grasp_pos()
-        hand_quat = wp.to_torch(self.robot.data.body_quat_w)[:, self.ee_body_idx]
         object_pos = self._get_object_pos()
         left_finger_pos, right_finger_pos = self._get_finger_positions()
 
-        reach_dist = torch.linalg.norm(object_pos - grasp_pos, dim=-1)
-        goal_dist = torch.linalg.norm(self.goal_pos - object_pos, dim=-1)
-        reaching_reward = 1.0 - torch.tanh(reach_dist / self.cfg.reaching_object_std)
-        pregrasp_reward, top_down_reward, top_down_alignment = self._compute_approach_shaping(
-            grasp_pos=grasp_pos,
-            hand_quat=hand_quat,
-            object_pos=object_pos,
-            reach_dist=reach_dist,
-        )
-
         joint_pos = wp.to_torch(self.robot.data.joint_pos)
+        joint_vel = wp.to_torch(self.robot.data.joint_vel)
         finger_joint_pos = joint_pos[:, self.finger_joint_ids].mean(dim=-1)
         (
-            gripper_open_reward,
-            gripper_close_reward,
-            grasp_reward,
-            premature_close_penalty,
-            secure_grasp_gate,
+            finger_midpoint,
             grasp_pose_gate,
+            _close_phase_gate,
+            _gripper_close_reward,
+            grasp_reward,
+            _secure_grasp_gate,
+            enclosure_gate,
+            _in_gripper_gate,
+            hold_gate,
             finger_open_fraction,
-        ) = self._compute_gripper_shaping(
+        ) = self._compute_grasp_metrics(
             object_pos=object_pos,
             left_finger_pos=left_finger_pos,
             right_finger_pos=right_finger_pos,
             finger_joint_pos=finger_joint_pos,
-            reach_dist=reach_dist,
-            lifted=(object_pos[:, 2] > self.cfg.lifted_height).float(),
         )
-        enclosure_gate = self._compute_enclosure_gate(
-            object_pos=object_pos,
-            left_finger_pos=left_finger_pos,
-            right_finger_pos=right_finger_pos,
-        )
+        reach_dist = torch.linalg.norm(object_pos - finger_midpoint, dim=-1)
+        reaching_reward = 1.0 - torch.tanh(reach_dist / self.cfg.reaching_object_std)
+        enclosure_reward = enclosure_gate * grasp_pose_gate * finger_open_fraction
         close_ready = self._compute_close_ready(
             reach_dist=reach_dist,
             grasp_pose_gate=grasp_pose_gate,
@@ -303,120 +310,43 @@ class FrankaCubeEnv(DirectRLEnv):
             finger_open_fraction=finger_open_fraction,
         )
         self.close_ready[:] = close_ready
-
+        self._update_reward_stage(
+            close_ready=close_ready,
+            hold_gate=hold_gate,
+        )
+        lift_progress_reward = self._compute_lift_progress_reward(object_pos=object_pos, grasp_gate=hold_gate)
         lifted_height = torch.clamp(
             object_pos[:, 2] - self.cube_default_root_pose[: object_pos.shape[0], 2].to(device=object_pos.device),
             min=0.0,
         )
-        lifted = (object_pos[:, 2] > self.cfg.lifted_height).float()
-        entered_close_stage, entered_lift_stage = self._update_reward_stage(
-            close_ready=close_ready,
-            secure_grasp_gate=secure_grasp_gate,
-            lifted=lifted,
-        )
-        approach_stage = (self.reward_stage == 0).float()
-        close_stage = (self.reward_stage == 1).float()
-        lift_stage = (self.reward_stage == 2).float()
-
-        finger_midpoint = 0.5 * (left_finger_pos + right_finger_pos)
-        left_dist = torch.linalg.norm(object_pos - left_finger_pos, dim=-1)
-        right_dist = torch.linalg.norm(object_pos - right_finger_pos, dim=-1)
-        finger_midpoint_dist = torch.linalg.norm(object_pos - finger_midpoint, dim=-1)
-        finger_balance = torch.abs(left_dist - right_dist)
-        in_gripper_gate = (
-            (1.0 - finger_open_fraction)
-            * (1.0 - torch.tanh(finger_midpoint_dist / self.cfg.in_gripper_midpoint_std))
-            * torch.exp(-finger_balance / self.cfg.in_gripper_balance_std)
-        )
-        in_gripper_gate = torch.clamp(in_gripper_gate, 0.0, 1.0)
-        hold_gate = torch.clamp(torch.maximum(secure_grasp_gate, in_gripper_gate), 0.0, 1.0)
-        stalled_grasp_penalty = (
-            (1.0 - finger_open_fraction)
-            * reaching_reward
-            * (1.0 - hold_gate)
-            * (lifted_height < self.cfg.stalled_grasp_height).float()
-        )
-
-        lift_progress_reward = self._compute_lift_progress_reward(object_pos=object_pos, grasp_gate=hold_gate)
-        lift_upward_velocity_reward = self._compute_lift_upward_velocity_reward(grasp_gate=secure_grasp_gate)
-        lifting_reward = hold_gate * lifted
-        goal_tracking_reward = lifted * hold_gate * (
-            1.0 - torch.tanh(goal_dist / self.cfg.object_goal_tracking_std)
-        )
-        goal_tracking_fine_reward = lifted * hold_gate * (
-            1.0 - torch.tanh(goal_dist / self.cfg.object_goal_tracking_fine_std)
-        )
-
-        progress = min(float(self.common_step_counter) / float(self.cfg.penalty_curriculum_steps), 1.0)
-        action_penalty_scale = self.cfg.action_penalty_scale + progress * (
-            self.cfg.action_penalty_max - self.cfg.action_penalty_scale
-        )
-        joint_vel_penalty_scale = self.cfg.joint_vel_penalty_scale + progress * (
-            self.cfg.joint_vel_penalty_max - self.cfg.joint_vel_penalty_scale
-        )
+        lifting_reward = hold_gate * (lifted_height >= self.cfg.lifted_height).float()
         action_penalty = torch.sum(self.actions.square(), dim=-1)
-        joint_vel = wp.to_torch(self.robot.data.joint_vel)
         joint_vel_penalty = torch.sum(joint_vel.square(), dim=-1)
 
         rewards = (
             self.cfg.reaching_object_scale * reaching_reward
-            + approach_stage
-            * (
-                self.cfg.pregrasp_reward_scale * pregrasp_reward
-                + self.cfg.top_down_reward_scale * top_down_reward
-                + self.cfg.gripper_open_reward_scale * gripper_open_reward
-                - self.cfg.premature_close_penalty_scale * premature_close_penalty
-            )
-            + close_stage
-            * (
-                self.cfg.close_stage_pose_reward_scale * grasp_pose_gate
-                + self.cfg.gripper_close_reward_scale * gripper_close_reward
-                + self.cfg.grasp_reward_scale * grasp_reward
-                - self.cfg.close_stage_open_penalty_scale * finger_open_fraction
-            )
-            + lift_stage
-            * (
-                self.cfg.lift_stage_hold_reward_scale * gripper_close_reward
-                + self.cfg.lift_stage_hold_reward_scale * grasp_reward
-                + self.cfg.lift_progress_reward_scale * lift_progress_reward
-                + self.cfg.lift_upward_velocity_reward_scale * lift_upward_velocity_reward
-                + self.cfg.lifting_object_scale * lifting_reward
-                + self.cfg.object_goal_tracking_scale * goal_tracking_reward
-                + self.cfg.object_goal_tracking_fine_scale * goal_tracking_fine_reward
-            )
-            + self.cfg.close_stage_bonus_scale * entered_close_stage
-            + self.cfg.lift_stage_bonus_scale * entered_lift_stage
-            - self.cfg.stalled_grasp_penalty_scale * stalled_grasp_penalty
-            - action_penalty_scale * action_penalty
-            - joint_vel_penalty_scale * joint_vel_penalty
+            + self.cfg.gripper_open_reward_scale * enclosure_reward
+            + self.cfg.grasp_reward_scale * grasp_reward
+            + self.cfg.lift_progress_reward_scale * lift_progress_reward
+            + self.cfg.lifting_object_scale * lifting_reward
+            - self.cfg.action_penalty_scale * action_penalty
+            - self.cfg.joint_vel_penalty_scale * joint_vel_penalty
         )
         rewards = torch.nan_to_num(rewards, nan=0.0, posinf=0.0, neginf=0.0)
 
         self.extras["log"] = {
             "reaching_reward": reaching_reward.mean(),
-            "pregrasp_reward": pregrasp_reward.mean(),
-            "top_down_reward": top_down_reward.mean(),
-            "top_down_alignment": top_down_alignment.mean(),
-            "gripper_open_reward": gripper_open_reward.mean(),
-            "gripper_close_reward": gripper_close_reward.mean(),
-            "grasp_reward": grasp_reward.mean(),
             "grasp_pose_gate": grasp_pose_gate.mean(),
-            "secure_grasp_gate": secure_grasp_gate.mean(),
             "enclosure_gate": enclosure_gate.mean(),
+            "enclosure_reward": enclosure_reward.mean(),
             "close_ready": close_ready.float().mean(),
-            "in_gripper_gate": in_gripper_gate.mean(),
+            "grasp_reward": grasp_reward.mean(),
+            "finger_open_fraction": finger_open_fraction.mean(),
             "hold_gate": hold_gate.mean(),
             "lift_progress_reward": lift_progress_reward.mean(),
-            "lift_upward_velocity_reward": lift_upward_velocity_reward.mean(),
             "lifting_reward": lifting_reward.mean(),
-            "goal_tracking_reward": goal_tracking_reward.mean(),
-            "goal_tracking_fine_reward": goal_tracking_fine_reward.mean(),
-            "premature_close_penalty": premature_close_penalty.mean(),
-            "stalled_grasp_penalty": stalled_grasp_penalty.mean(),
             "action_penalty": action_penalty.mean(),
             "joint_vel_penalty": joint_vel_penalty.mean(),
-            "action_penalty_scale": torch.tensor(action_penalty_scale, device=self.device),
-            "joint_vel_penalty_scale": torch.tensor(joint_vel_penalty_scale, device=self.device),
         }
         return rewards
 
@@ -539,23 +469,29 @@ class FrankaCubeEnv(DirectRLEnv):
             max=1.0,
         )
 
-    def _compute_gripper_shaping(
+    def _compute_grasp_metrics(
         self,
         object_pos: torch.Tensor,
         left_finger_pos: torch.Tensor,
         right_finger_pos: torch.Tensor,
         finger_joint_pos: torch.Tensor,
-        reach_dist: torch.Tensor,
-        lifted: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute gripper-specific shaping rewards for approach and grasp."""
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Compute grasp-quality metrics shared by observations and rewards."""
         finger_open_fraction = torch.clamp(
             (finger_joint_pos - self.gripper_close_pos) / self._gripper_span,
             0.0,
             1.0,
-        )
-        near_object_gate = torch.sigmoid(
-            self.cfg.gripper_reward_sharpness * (self.cfg.gripper_reward_distance_thresh - reach_dist)
         )
         finger_midpoint = 0.5 * (left_finger_pos + right_finger_pos)
         midpoint_dist = torch.linalg.norm(object_pos - finger_midpoint, dim=-1)
@@ -568,26 +504,29 @@ class FrankaCubeEnv(DirectRLEnv):
         midpoint_reward = 1.0 - torch.tanh(midpoint_dist / self.cfg.grasp_midpoint_std)
         balance_reward = torch.exp(-torch.abs(left_dist - right_dist) / self.cfg.grasp_balance_std)
         finger_height_reward = 1.0 - torch.tanh(finger_height_err / self.cfg.grasp_finger_height_std)
-        grasp_pose_gate = near_object_gate * midpoint_reward * balance_reward * finger_height_reward
-
-        close_phase_gate = torch.sigmoid(
-            self.cfg.close_phase_sharpness * (grasp_pose_gate - self.cfg.close_phase_gate_thresh)
-        )
-        keep_open_gate = (1.0 - lifted) * (1.0 - close_phase_gate)
-
-        gripper_open_reward = keep_open_gate * finger_open_fraction
+        grasp_pose_gate = torch.clamp(midpoint_reward * balance_reward * finger_height_reward, 0.0, 1.0)
         gripper_close_reward = 1.0 - finger_open_fraction
-        grasp_reward = grasp_pose_gate * (1.0 - finger_open_fraction)
-        premature_close_penalty = keep_open_gate * (1.0 - finger_open_fraction)
-        secure_grasp_gate = close_phase_gate * grasp_pose_gate * (1.0 - finger_open_fraction)
+        enclosure_gate = self._compute_enclosure_gate(
+            object_pos=object_pos,
+            left_finger_pos=left_finger_pos,
+            right_finger_pos=right_finger_pos,
+        )
+        close_phase_gate = torch.clamp(grasp_pose_gate * enclosure_gate, 0.0, 1.0)
+        grasp_reward = close_phase_gate * gripper_close_reward
+        secure_grasp_gate = grasp_reward
+        in_gripper_gate = grasp_reward
+        hold_gate = grasp_reward
 
         return (
-            gripper_open_reward,
+            finger_midpoint,
+            grasp_pose_gate,
+            close_phase_gate,
             gripper_close_reward,
             grasp_reward,
-            premature_close_penalty,
             secure_grasp_gate,
-            grasp_pose_gate,
+            enclosure_gate,
+            in_gripper_gate,
+            hold_gate,
             finger_open_fraction,
         )
 
@@ -626,16 +565,15 @@ class FrankaCubeEnv(DirectRLEnv):
     def _update_reward_stage(
         self,
         close_ready: torch.Tensor,
-        secure_grasp_gate: torch.Tensor,
-        lifted: torch.Tensor,
+        hold_gate: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Advance the staged reward machine: approach -> close -> lift."""
+        """Advance the staged reward machine once the cube is actually secured."""
         ready_for_close = (self.reward_stage == 0) & close_ready
         self.reward_stage = torch.where(ready_for_close, torch.ones_like(self.reward_stage), self.reward_stage)
 
         ready_for_lift = (
             (self.reward_stage == 1)
-            & ((secure_grasp_gate >= self.cfg.lift_stage_secure_grasp_thresh) | (lifted > 0.0))
+            & (hold_gate >= self.cfg.lift_stage_secure_grasp_thresh)
         )
         self.reward_stage = torch.where(ready_for_lift, torch.full_like(self.reward_stage, 2), self.reward_stage)
         return ready_for_close.float(), ready_for_lift.float()
