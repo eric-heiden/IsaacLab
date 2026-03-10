@@ -288,8 +288,11 @@ class NewtonManager(PhysicsManager):
         device = PhysicsManager._device
         logger.info(f"Finalizing model on device: {device}")
         cls._builder.up_axis = Axis.from_string(cls._up_axis)
-        # Set smaller contact margin for manipulation examples (default 10cm is too large)
-        cls._builder.default_shape_cfg.contact_margin = 0.01
+        # Set smaller contact margin for manipulation examples (default 10 cm is too large),
+        # but respect any task-local override applied during MODEL_INIT callbacks.
+        current_contact_margin = getattr(cls._builder.default_shape_cfg, "contact_margin", None)
+        if current_contact_margin is not None and abs(float(current_contact_margin) - 0.1) < 1.0e-9:
+            cls._builder.default_shape_cfg.contact_margin = 0.01
         with Timer(name="newton_finalize_builder", msg="Finalize builder took:"):
             cls._model = cls._builder.finalize(device=device)
             cls._model.set_gravity(cls._gravity_vector)

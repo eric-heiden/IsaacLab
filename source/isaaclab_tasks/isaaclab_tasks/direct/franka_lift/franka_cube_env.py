@@ -8,12 +8,15 @@ from __future__ import annotations
 import torch
 import warp as wp
 from collections.abc import Sequence
+from torch.nn import functional as F
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.envs import DirectRLEnv
+from isaaclab.physics import PhysicsEvent
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-from isaaclab.utils.math import combine_frame_transforms, sample_uniform, subtract_frame_transforms
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
+from isaaclab.utils.math import quat_apply, sample_uniform
 
 from .franka_cube_env_cfg import FrankaCubeEnvCfg
 
@@ -28,20 +31,28 @@ class FrankaCubeEnv(DirectRLEnv):
         joint_pos_limits = wp.to_torch(self.robot.data.soft_joint_pos_limits)[0]
         self.robot_dof_lower_limits = joint_pos_limits[:, 0].to(self.device)
         self.robot_dof_upper_limits = joint_pos_limits[:, 1].to(self.device)
+        self.arm_joint_indices, _ = self.robot.find_joints("panda_joint[1-7]")
+        self.arm_action_scale = self._resolve_arm_action_scale()
+        self.arm_dof_lower_limits = self.robot_dof_lower_limits[self.arm_joint_indices]
+        self.arm_dof_upper_limits = self.robot_dof_upper_limits[self.arm_joint_indices]
+        self.arm_dof_velocity_limits = wp.to_torch(self.robot.data.joint_vel_limits)[0, self.arm_joint_indices].to(self.device)
 
         # Store default joint positions for relative observations
         self.robot_default_joint_pos = wp.to_torch(self.robot.data.default_joint_pos).clone()
+        self.cube_default_root_pose = wp.to_torch(self.cube.data.default_root_pose).clone()
+        self.cube_default_root_vel = wp.to_torch(self.cube.data.default_root_vel).clone()
 
         # Buffers for actions and targets
-        self.robot_dof_targets = torch.zeros(
-            (self.num_envs, self.robot.num_joints), dtype=torch.float, device=self.device
-        )
+        self.robot_dof_targets = self.robot_default_joint_pos.clone()
+        self.actions = torch.zeros((self.num_envs, self.cfg.action_space), dtype=torch.float, device=self.device)
         self.previous_actions = torch.zeros(
             (self.num_envs, self.cfg.action_space), dtype=torch.float, device=self.device
         )
 
         # Goal position buffer (in robot's local frame)
         self.goal_pos = torch.zeros((self.num_envs, 3), dtype=torch.float, device=self.device)
+        self.reward_stage = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
+        self.close_ready = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
 
         # Get body indices for reward computation
         self.ee_body_idx = self.robot.body_names.index("panda_hand")
@@ -50,18 +61,54 @@ class FrankaCubeEnv(DirectRLEnv):
 
         # Precompute gripper open/close positions
         self.finger_joint_indices = [
-            self.robot.joint_names.index(name) 
-            for name in self.robot.joint_names 
+            self.robot.joint_names.index(name)
+            for name in self.robot.joint_names
             if "panda_finger_joint" in name
         ]
-        self.gripper_open_pos = 0.04
-        self.gripper_close_pos = 0.0
+        self.finger_joint_ids = torch.tensor(self.finger_joint_indices, device=self.device, dtype=torch.long)
+        self.finger_dof_lower_limits = self.robot_dof_lower_limits[self.finger_joint_ids]
+        self.finger_dof_upper_limits = self.robot_dof_upper_limits[self.finger_joint_ids]
+
+        finger_lower_limit = float(self.finger_dof_lower_limits.max().item())
+        finger_upper_limit = float(self.finger_dof_upper_limits.min().item())
+        finger_limit_margin = min(5.0e-4, 0.25 * max(finger_upper_limit - finger_lower_limit, 0.0))
+        safe_finger_lower_limit = finger_lower_limit + finger_limit_margin
+        safe_finger_upper_limit = finger_upper_limit - finger_limit_margin
+
+        self.gripper_open_pos = float(
+            torch.clamp(torch.tensor(0.04, device=self.device), safe_finger_lower_limit, safe_finger_upper_limit).item()
+        )
+        self.gripper_close_pos = float(
+            torch.clamp(torch.tensor(0.0, device=self.device), safe_finger_lower_limit, safe_finger_upper_limit).item()
+        )
+        self.robot_default_joint_pos[:, self.finger_joint_indices] = self.gripper_open_pos
+        self._gripper_span = max(self.gripper_open_pos - self.gripper_close_pos, 1.0e-6)
+        self.grasp_frame_offset = torch.tensor(
+            (0.0, 0.0, 0.1034),
+            device=self.device,
+            dtype=self.robot_default_joint_pos.dtype,
+        )
+        self.finger_contact_offset = torch.tensor(
+            (0.0, 0.0, 0.046),
+            device=self.device,
+            dtype=self.robot_default_joint_pos.dtype,
+        )
+        self._sample_goal_positions(wp.to_torch(self.robot._ALL_INDICES).to(dtype=torch.long))
 
     def _setup_scene(self):
+        self._register_newton_contact_callback()
         self.robot = Articulation(self.cfg.robot_cfg)
         self.cube = RigidObject(self.cfg.cube)
-        # add ground plane
-        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
+        # Mirror the stable Franka lift scene so the fixed-base robot is
+        # supported by the table instead of contacting the world ground plane.
+        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg(), translation=(0.0, 0.0, -1.05))
+        table_cfg = sim_utils.UsdFileCfg(usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Mounts/SeattleLabTable/table_instanceable.usd")
+        table_cfg.func(
+            "/World/envs/env_.*/Table",
+            table_cfg,
+            translation=(0.5, 0.0, 0.0),
+            orientation=(0.0, 0.0, 0.70711, 0.70711),
+        )
         # clone and replicate
         self.scene.clone_environments(copy_from_source=False)
         # we need to explicitly filter collisions for CPU simulation
@@ -74,233 +121,750 @@ class FrankaCubeEnv(DirectRLEnv):
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
+    def close(self):
+        """Cleanup the environment and deregister task-local Newton callbacks."""
+        handle = getattr(self, "_newton_model_init_handle", None)
+        if handle is not None:
+            handle.deregister()
+            self._newton_model_init_handle = None
+        super().close()
+
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self.actions = actions.clone().clamp(-1.0, 1.0)
 
-    def _apply_action(self) -> None:
-        current_joint_pos = wp.to_torch(self.robot.data.joint_pos)
-
-        arm_targets = current_joint_pos[:, :7] + self.cfg.action_scale * self.actions[:, :7]
-
-        gripper_open = self.actions[:, 7] > 0.0
-        finger_val = torch.where(gripper_open, self.gripper_open_pos, self.gripper_close_pos)
-        finger_targets = finger_val.unsqueeze(-1).expand(-1, 2)
-
-        targets = torch.cat([arm_targets, finger_targets], dim=-1)
-
-        self.robot_dof_targets = torch.clamp(
-            targets, self.robot_dof_lower_limits, self.robot_dof_upper_limits
+        arm_targets = self.robot_default_joint_pos[:, self.arm_joint_indices] + self.arm_action_scale.unsqueeze(
+            0
+        ) * self.actions[:, : len(self.arm_joint_indices)]
+        self.robot_dof_targets[:, self.arm_joint_indices] = torch.clamp(
+            arm_targets,
+            self.arm_dof_lower_limits.unsqueeze(0),
+            self.arm_dof_upper_limits.unsqueeze(0),
         )
 
-        self.robot.set_joint_position_target(self.robot_dof_targets)
+        # Keep the gripper open during the approach phase until the previous
+        # step confirmed that the cube is properly enclosed by the fingers.
+        allow_close_control = (self.reward_stage > 0) | self.close_ready
+        self.actions[:, 7] = torch.where(allow_close_control, self.actions[:, 7], torch.ones_like(self.actions[:, 7]))
+
+        finger_cmd = 0.5 * (self.actions[:, 7] + 1.0)
+        finger_target = self.gripper_close_pos + finger_cmd * (self.gripper_open_pos - self.gripper_close_pos)
+        self.robot_dof_targets[:, self.finger_joint_indices] = finger_target.unsqueeze(-1).expand(
+            -1, len(self.finger_joint_indices)
+        )
+
+    def _apply_action(self) -> None:
+        # Newton can leak the finger prismatic joints past their USD stops, so
+        # clamp them back into range before applying the next target.
+        self._enforce_finger_joint_limits()
+        self._enforce_arm_joint_velocity_limits()
+        self.robot.set_joint_position_target_index(target=self.robot_dof_targets)
+
+    def _resolve_arm_action_scale(self) -> torch.Tensor:
+        """Return per-joint arm action scales as a length-7 tensor."""
+        arm_action_scale = torch.as_tensor(
+            self.cfg.action_scale,
+            device=self.device,
+            dtype=self.robot_dof_lower_limits.dtype,
+        )
+        if arm_action_scale.ndim == 0:
+            arm_action_scale = arm_action_scale.repeat(len(self.arm_joint_indices))
+        else:
+            arm_action_scale = arm_action_scale.flatten()
+        if arm_action_scale.numel() != len(self.arm_joint_indices):
+            raise ValueError(
+                "action_scale must be a scalar or provide one value per Franka arm joint "
+                f"({len(self.arm_joint_indices)} values)."
+            )
+        return arm_action_scale
+
+    def _enforce_arm_joint_velocity_limits(self) -> None:
+        """Clamp arm joint speeds back into the configured Franka limits."""
+        joint_vel = wp.to_torch(self.robot.data.joint_vel)
+        arm_joint_vel = joint_vel[:, self.arm_joint_indices]
+        clamped_arm_joint_vel = torch.clamp(
+            arm_joint_vel,
+            -self.arm_dof_velocity_limits.unsqueeze(0),
+            self.arm_dof_velocity_limits.unsqueeze(0),
+        )
+        too_fast = torch.any(torch.abs(clamped_arm_joint_vel - arm_joint_vel) > 1.0e-6, dim=-1)
+        if not torch.any(too_fast):
+            return
+
+        env_ids = too_fast.nonzero(as_tuple=False).squeeze(-1)
+        self.robot.write_joint_velocity_to_sim_index(
+            velocity=clamped_arm_joint_vel[env_ids],
+            joint_ids=self.arm_joint_indices,
+            env_ids=env_ids,
+        )
+
+    def _enforce_finger_joint_limits(self) -> None:
+        """Clamp finger joints back into their valid range if Newton drifts past the stops."""
+        joint_pos = wp.to_torch(self.robot.data.joint_pos)
+        finger_joint_pos = joint_pos[:, self.finger_joint_ids]
+        clamped_finger_joint_pos = torch.clamp(
+            finger_joint_pos,
+            self.finger_dof_lower_limits.unsqueeze(0),
+            self.finger_dof_upper_limits.unsqueeze(0),
+        )
+        out_of_bounds = torch.any(torch.abs(clamped_finger_joint_pos - finger_joint_pos) > 1.0e-6, dim=-1)
+        if not torch.any(out_of_bounds):
+            return
+
+        env_ids = out_of_bounds.nonzero(as_tuple=False).squeeze(-1)
+        zero_finger_vel = torch.zeros(
+            (env_ids.numel(), len(self.finger_joint_indices)),
+            dtype=joint_pos.dtype,
+            device=self.device,
+        )
+        self.robot.write_joint_position_to_sim_index(
+            position=clamped_finger_joint_pos[env_ids],
+            joint_ids=self.finger_joint_indices,
+            env_ids=env_ids,
+        )
+        self.robot.write_joint_velocity_to_sim_index(
+            velocity=zero_finger_vel,
+            joint_ids=self.finger_joint_indices,
+            env_ids=env_ids,
+        )
 
     def _get_observations(self) -> dict:
+        self._enforce_arm_joint_velocity_limits()
+        self._enforce_finger_joint_limits()
 
-        # Joint positions relative to default
         joint_pos = wp.to_torch(self.robot.data.joint_pos)
-        joint_pos_rel = joint_pos - self.robot_default_joint_pos
-
-        # Joint velocities
         joint_vel = wp.to_torch(self.robot.data.joint_vel)
+        object_pos = self._get_object_pos()
+        grasp_pos = self._get_grasp_pos()
+        left_finger_pos, right_finger_pos = self._get_finger_positions()
 
-        # Object position in robot's local frame
-        object_pos_local = self._get_object_pos_in_robot_frame()
-
-        # Goal position (already in robot's local frame)
-        goal_pos_local = self.goal_pos
-
-        # Last actions
-        last_actions = self.previous_actions
-
-        # Concatenate all observations
         obs = torch.cat(
-            (
-                joint_pos_rel,       # 9
-                joint_vel,           # 9
-                object_pos_local,    # 3
-                goal_pos_local,      # 3
-                last_actions,        # 8
-            ),
+            [
+                joint_pos - self.robot_default_joint_pos,
+                joint_vel,
+                object_pos - grasp_pos,
+                object_pos - left_finger_pos,
+                object_pos - right_finger_pos,
+                self.goal_pos - object_pos,
+                self.previous_actions,
+                F.one_hot(self.reward_stage, num_classes=3).to(dtype=joint_pos.dtype),
+            ],
             dim=-1,
         )
-
-        # Store current actions for next observation
-        self.previous_actions = self.actions.clone()
-
+        obs = torch.nan_to_num(obs, nan=0.0, posinf=100.0, neginf=-100.0)
+        obs = torch.clamp(obs, -100.0, 100.0)
+        self.previous_actions[:] = self.actions
         return {"policy": obs}
 
-    def _get_object_pos_in_robot_frame(self) -> torch.Tensor:
-        """Get object position relative to robot base frame."""
-        robot_pos = wp.to_torch(self.robot.data.root_pos_w)
-        robot_quat = wp.to_torch(self.robot.data.root_quat_w)
-        object_pos = wp.to_torch(self.cube.data.root_pos_w)
-
-        object_pos_local, _ = subtract_frame_transforms(robot_pos, robot_quat, object_pos)
-        return object_pos_local
-
     def _get_rewards(self) -> torch.Tensor:
-        body_pos = wp.to_torch(self.robot.data.body_pos_w)
-        ee_pos = body_pos[:, self.ee_body_idx]
-        lf_pos = body_pos[:, self.lf_body_idx]
-        rf_pos = body_pos[:, self.rf_body_idx]
-        object_pos = wp.to_torch(self.cube.data.root_pos_w)
-        robot_pos = wp.to_torch(self.robot.data.root_pos_w)
-        robot_quat = wp.to_torch(self.robot.data.root_quat_w)
+        self._enforce_arm_joint_velocity_limits()
+        self._enforce_finger_joint_limits()
+        grasp_pos = self._get_grasp_pos()
+        hand_quat = wp.to_torch(self.robot.data.body_quat_w)[:, self.ee_body_idx]
+        object_pos = self._get_object_pos()
+        left_finger_pos, right_finger_pos = self._get_finger_positions()
 
-        goal_pos_world, _ = combine_frame_transforms(robot_pos, robot_quat, self.goal_pos)
-
-        # 1. Three-point reaching reward: EEF + left fingertip + right fingertip
-        d_ee = torch.norm(ee_pos - object_pos, dim=-1)
-        d_lf = torch.norm(lf_pos - object_pos, dim=-1)
-        d_rf = torch.norm(rf_pos - object_pos, dim=-1)
-        reaching_reward = 1.0 - torch.tanh((d_ee + d_lf + d_rf) / 3.0 / self.cfg.reaching_object_std)
-
-        # 2. Lifting reward: binary, gated on object height
-        object_height = object_pos[:, 2]
-        lifting_reward = torch.where(
-            object_height > self.cfg.lifting_object_min_height,
-            torch.ones_like(object_height),
-            torch.zeros_like(object_height),
+        reach_dist = torch.linalg.norm(object_pos - grasp_pos, dim=-1)
+        goal_dist = torch.linalg.norm(self.goal_pos - object_pos, dim=-1)
+        reaching_reward = 1.0 - torch.tanh(reach_dist / self.cfg.reaching_object_std)
+        pregrasp_reward, top_down_reward, top_down_alignment = self._compute_approach_shaping(
+            grasp_pos=grasp_pos,
+            hand_quat=hand_quat,
+            object_pos=object_pos,
+            reach_dist=reach_dist,
         )
 
-        # 3. Object-goal tracking, coarse (gated on height)
-        object_to_goal_dist = torch.norm(object_pos - goal_pos_world, dim=-1)
-        is_lifted = (object_height > self.cfg.lifting_object_min_height).float()
-        goal_tracking_reward = (
-            is_lifted * (1.0 - torch.tanh(object_to_goal_dist / self.cfg.object_goal_tracking_std))
+        joint_pos = wp.to_torch(self.robot.data.joint_pos)
+        finger_joint_pos = joint_pos[:, self.finger_joint_ids].mean(dim=-1)
+        (
+            gripper_open_reward,
+            gripper_close_reward,
+            grasp_reward,
+            premature_close_penalty,
+            secure_grasp_gate,
+            grasp_pose_gate,
+            finger_open_fraction,
+        ) = self._compute_gripper_shaping(
+            object_pos=object_pos,
+            left_finger_pos=left_finger_pos,
+            right_finger_pos=right_finger_pos,
+            finger_joint_pos=finger_joint_pos,
+            reach_dist=reach_dist,
+            lifted=(object_pos[:, 2] > self.cfg.lifted_height).float(),
+        )
+        enclosure_gate = self._compute_enclosure_gate(
+            object_pos=object_pos,
+            left_finger_pos=left_finger_pos,
+            right_finger_pos=right_finger_pos,
+        )
+        close_ready = self._compute_close_ready(
+            reach_dist=reach_dist,
+            grasp_pose_gate=grasp_pose_gate,
+            enclosure_gate=enclosure_gate,
+            finger_open_fraction=finger_open_fraction,
+        )
+        self.close_ready[:] = close_ready
+
+        lifted_height = torch.clamp(
+            object_pos[:, 2] - self.cube_default_root_pose[: object_pos.shape[0], 2].to(device=object_pos.device),
+            min=0.0,
+        )
+        lifted = (object_pos[:, 2] > self.cfg.lifted_height).float()
+        entered_close_stage, entered_lift_stage = self._update_reward_stage(
+            close_ready=close_ready,
+            secure_grasp_gate=secure_grasp_gate,
+            lifted=lifted,
+        )
+        approach_stage = (self.reward_stage == 0).float()
+        close_stage = (self.reward_stage == 1).float()
+        lift_stage = (self.reward_stage == 2).float()
+
+        finger_midpoint = 0.5 * (left_finger_pos + right_finger_pos)
+        left_dist = torch.linalg.norm(object_pos - left_finger_pos, dim=-1)
+        right_dist = torch.linalg.norm(object_pos - right_finger_pos, dim=-1)
+        finger_midpoint_dist = torch.linalg.norm(object_pos - finger_midpoint, dim=-1)
+        finger_balance = torch.abs(left_dist - right_dist)
+        in_gripper_gate = (
+            (1.0 - finger_open_fraction)
+            * (1.0 - torch.tanh(finger_midpoint_dist / self.cfg.in_gripper_midpoint_std))
+            * torch.exp(-finger_balance / self.cfg.in_gripper_balance_std)
+        )
+        in_gripper_gate = torch.clamp(in_gripper_gate, 0.0, 1.0)
+        hold_gate = torch.clamp(torch.maximum(secure_grasp_gate, in_gripper_gate), 0.0, 1.0)
+        stalled_grasp_penalty = (
+            (1.0 - finger_open_fraction)
+            * reaching_reward
+            * (1.0 - hold_gate)
+            * (lifted_height < self.cfg.stalled_grasp_height).float()
         )
 
-        # 4. Object-goal tracking, fine (gated on height)
-        goal_tracking_fine_reward = (
-            is_lifted * (1.0 - torch.tanh(object_to_goal_dist / self.cfg.object_goal_tracking_fine_std))
+        lift_progress_reward = self._compute_lift_progress_reward(object_pos=object_pos, grasp_gate=hold_gate)
+        lift_upward_velocity_reward = self._compute_lift_upward_velocity_reward(grasp_gate=secure_grasp_gate)
+        lifting_reward = hold_gate * lifted
+        goal_tracking_reward = lifted * hold_gate * (
+            1.0 - torch.tanh(goal_dist / self.cfg.object_goal_tracking_std)
+        )
+        goal_tracking_fine_reward = lifted * hold_gate * (
+            1.0 - torch.tanh(goal_dist / self.cfg.object_goal_tracking_fine_std)
         )
 
-        # 5. Penalties with curriculum ramp
-        progress = min(self.common_step_counter / self.cfg.penalty_curriculum_steps, 1.0)
-        action_scale = self.cfg.action_penalty_scale + progress * (
+        progress = min(float(self.common_step_counter) / float(self.cfg.penalty_curriculum_steps), 1.0)
+        action_penalty_scale = self.cfg.action_penalty_scale + progress * (
             self.cfg.action_penalty_max - self.cfg.action_penalty_scale
         )
-        vel_scale = self.cfg.joint_vel_penalty_scale + progress * (
+        joint_vel_penalty_scale = self.cfg.joint_vel_penalty_scale + progress * (
             self.cfg.joint_vel_penalty_max - self.cfg.joint_vel_penalty_scale
         )
-        action_penalty = torch.sum(self.actions**2, dim=-1)
+        action_penalty = torch.sum(self.actions.square(), dim=-1)
         joint_vel = wp.to_torch(self.robot.data.joint_vel)
-        joint_vel_penalty = torch.sum(joint_vel**2, dim=-1)
+        joint_vel_penalty = torch.sum(joint_vel.square(), dim=-1)
 
-        total_reward = (
+        rewards = (
             self.cfg.reaching_object_scale * reaching_reward
-            + self.cfg.lifting_object_scale * lifting_reward
-            + self.cfg.object_goal_tracking_scale * goal_tracking_reward
-            + self.cfg.object_goal_tracking_fine_scale * goal_tracking_fine_reward
-            - action_scale * action_penalty
-            - vel_scale * joint_vel_penalty
+            + approach_stage
+            * (
+                self.cfg.pregrasp_reward_scale * pregrasp_reward
+                + self.cfg.top_down_reward_scale * top_down_reward
+                + self.cfg.gripper_open_reward_scale * gripper_open_reward
+                - self.cfg.premature_close_penalty_scale * premature_close_penalty
+            )
+            + close_stage
+            * (
+                self.cfg.close_stage_pose_reward_scale * grasp_pose_gate
+                + self.cfg.gripper_close_reward_scale * gripper_close_reward
+                + self.cfg.grasp_reward_scale * grasp_reward
+                - self.cfg.close_stage_open_penalty_scale * finger_open_fraction
+            )
+            + lift_stage
+            * (
+                self.cfg.lift_stage_hold_reward_scale * gripper_close_reward
+                + self.cfg.lift_stage_hold_reward_scale * grasp_reward
+                + self.cfg.lift_progress_reward_scale * lift_progress_reward
+                + self.cfg.lift_upward_velocity_reward_scale * lift_upward_velocity_reward
+                + self.cfg.lifting_object_scale * lifting_reward
+                + self.cfg.object_goal_tracking_scale * goal_tracking_reward
+                + self.cfg.object_goal_tracking_fine_scale * goal_tracking_fine_reward
+            )
+            + self.cfg.close_stage_bonus_scale * entered_close_stage
+            + self.cfg.lift_stage_bonus_scale * entered_lift_stage
+            - self.cfg.stalled_grasp_penalty_scale * stalled_grasp_penalty
+            - action_penalty_scale * action_penalty
+            - joint_vel_penalty_scale * joint_vel_penalty
         )
+        rewards = torch.nan_to_num(rewards, nan=0.0, posinf=0.0, neginf=0.0)
 
         self.extras["log"] = {
             "reaching_reward": reaching_reward.mean(),
+            "pregrasp_reward": pregrasp_reward.mean(),
+            "top_down_reward": top_down_reward.mean(),
+            "top_down_alignment": top_down_alignment.mean(),
+            "gripper_open_reward": gripper_open_reward.mean(),
+            "gripper_close_reward": gripper_close_reward.mean(),
+            "grasp_reward": grasp_reward.mean(),
+            "grasp_pose_gate": grasp_pose_gate.mean(),
+            "secure_grasp_gate": secure_grasp_gate.mean(),
+            "enclosure_gate": enclosure_gate.mean(),
+            "close_ready": close_ready.float().mean(),
+            "in_gripper_gate": in_gripper_gate.mean(),
+            "hold_gate": hold_gate.mean(),
+            "lift_progress_reward": lift_progress_reward.mean(),
+            "lift_upward_velocity_reward": lift_upward_velocity_reward.mean(),
             "lifting_reward": lifting_reward.mean(),
             "goal_tracking_reward": goal_tracking_reward.mean(),
             "goal_tracking_fine_reward": goal_tracking_fine_reward.mean(),
+            "premature_close_penalty": premature_close_penalty.mean(),
+            "stalled_grasp_penalty": stalled_grasp_penalty.mean(),
             "action_penalty": action_penalty.mean(),
             "joint_vel_penalty": joint_vel_penalty.mean(),
-            "penalty_scale": torch.tensor(action_scale),
+            "action_penalty_scale": torch.tensor(action_penalty_scale, device=self.device),
+            "joint_vel_penalty_scale": torch.tensor(joint_vel_penalty_scale, device=self.device),
         }
-
-        return total_reward
-
+        return rewards
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        # Get object height
-        object_height = wp.to_torch(self.cube.data.root_pos_w)[:, 2]
-
-        # Termination: object fell off table
+        object_height = self._get_object_pos()[:, 2]
         terminated = object_height < self.cfg.object_drop_height
-
-        # Truncation: episode timeout
         truncated = self.episode_length_buf >= self.max_episode_length - 1
-
         return terminated, truncated
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
         if env_ids is None:
-            env_ids = wp.to_torch(self.robot._ALL_INDICES)
+            env_ids_tensor = wp.to_torch(self.robot._ALL_INDICES).to(dtype=torch.long)
         else:
-            env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
-        super()._reset_idx(env_ids)
+            env_ids_tensor = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        super()._reset_idx(env_ids_tensor)
 
-        num_resets = len(env_ids)
+        default_root_pose = wp.to_torch(self.robot.data.default_root_pose)[env_ids_tensor].clone()
+        default_root_vel = wp.to_torch(self.robot.data.default_root_vel)[env_ids_tensor].clone()
+        default_root_pose[:, :3] += self.scene.env_origins[env_ids_tensor]
+        self.robot.write_root_pose_to_sim_index(root_pose=default_root_pose, env_ids=env_ids_tensor)
+        self.robot.write_root_velocity_to_sim_index(root_velocity=default_root_vel, env_ids=env_ids_tensor)
 
-        # ---- Reset Robot ----
-        default_root_pose = wp.to_torch(self.robot.data.default_root_pose)[env_ids].clone()
-        default_root_pose[:, :3] += self.scene.env_origins[env_ids]
-        self.robot.write_root_pose_to_sim(default_root_pose, env_ids)
-
-        joint_pos = wp.to_torch(self.robot.data.default_joint_pos)[env_ids].clone()
+        joint_pos = self.robot_default_joint_pos[env_ids_tensor].clone()
+        arm_noise = sample_uniform(
+            -self.cfg.reset_arm_noise,
+            self.cfg.reset_arm_noise,
+            (len(env_ids_tensor), len(self.arm_joint_indices)),
+            self.device,
+        )
+        joint_pos[:, self.arm_joint_indices] = torch.clamp(
+            joint_pos[:, self.arm_joint_indices] + arm_noise,
+            self.arm_dof_lower_limits.unsqueeze(0),
+            self.arm_dof_upper_limits.unsqueeze(0),
+        )
+        joint_pos[:, self.finger_joint_indices] = self.gripper_open_pos
         joint_vel = torch.zeros_like(joint_pos)
+        self.robot_dof_targets[env_ids_tensor] = joint_pos
+        self.actions[env_ids_tensor] = 0.0
+        self.previous_actions[env_ids_tensor] = 0.0
+        self.reward_stage[env_ids_tensor] = 0
+        self.close_ready[env_ids_tensor] = False
+        self.robot.set_joint_position_target_index(target=joint_pos, env_ids=env_ids_tensor)
+        self.robot.write_joint_position_to_sim_index(position=joint_pos, env_ids=env_ids_tensor)
+        self.robot.write_joint_velocity_to_sim_index(velocity=joint_vel, env_ids=env_ids_tensor)
 
-        self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
-        self.robot.set_joint_position_target(joint_pos, env_ids=env_ids)
-
-        self.robot_dof_targets[env_ids] = joint_pos
-
-        # ---- Reset Object (Cube) ----
-        object_default_pose = wp.to_torch(self.cube.data.default_root_pose)[env_ids].clone()
-        object_default_vel = wp.to_torch(self.cube.data.default_root_vel)[env_ids].clone()
-
-        # Add position noise
-        pos_noise_x = sample_uniform(
+        object_pose = self.cube_default_root_pose[env_ids_tensor].clone()
+        object_vel = self.cube_default_root_vel[env_ids_tensor].clone()
+        object_pose[:, 0] += sample_uniform(
             self.cfg.object_reset_pos_x_range[0],
             self.cfg.object_reset_pos_x_range[1],
-            (num_resets,),
+            (len(env_ids_tensor),),
             self.device,
         )
-        pos_noise_y = sample_uniform(
+        object_pose[:, 1] += sample_uniform(
             self.cfg.object_reset_pos_y_range[0],
             self.cfg.object_reset_pos_y_range[1],
-            (num_resets,),
+            (len(env_ids_tensor),),
             self.device,
         )
+        object_pose[:, :3] += self.scene.env_origins[env_ids_tensor]
+        object_vel.zero_()
+        self.cube.write_root_pose_to_sim_index(root_pose=object_pose, env_ids=env_ids_tensor)
+        self.cube.write_root_velocity_to_sim_index(root_velocity=object_vel, env_ids=env_ids_tensor)
 
-        object_default_pose[:, 0] += pos_noise_x
-        object_default_pose[:, 1] += pos_noise_y
-        # Add env origins
-        object_default_pose[:, :3] += self.scene.env_origins[env_ids]
+        self._sample_goal_positions(env_ids_tensor)
 
-        object_default_vel.zero_()
-
-        self.cube.write_root_pose_to_sim(object_default_pose, env_ids)
-        self.cube.write_root_velocity_to_sim(object_default_vel, env_ids)
-
-        # ---- Reset Goal ----
-        self._reset_goal(env_ids)
-
-        # ---- Reset Buffers ----
-        self.previous_actions[env_ids] = 0.0
-
-    def _reset_goal(self, env_ids: Sequence[int]):
-        """Generate new random goal positions."""
-        num_resets = len(env_ids)
-
-        # Sample random goal positions in robot's local frame
-        goal_x = sample_uniform(
+    def _sample_goal_positions(self, env_ids: torch.Tensor) -> None:
+        self.goal_pos[env_ids, 0] = sample_uniform(
             self.cfg.goal_pos_x_range[0],
             self.cfg.goal_pos_x_range[1],
-            (num_resets,),
+            (len(env_ids),),
             self.device,
         )
-        goal_y = sample_uniform(
+        self.goal_pos[env_ids, 1] = sample_uniform(
             self.cfg.goal_pos_y_range[0],
             self.cfg.goal_pos_y_range[1],
-            (num_resets,),
+            (len(env_ids),),
             self.device,
         )
-        goal_z = sample_uniform(
+        self.goal_pos[env_ids, 2] = sample_uniform(
             self.cfg.goal_pos_z_range[0],
             self.cfg.goal_pos_z_range[1],
-            (num_resets,),
+            (len(env_ids),),
             self.device,
         )
 
-        self.goal_pos[env_ids, 0] = goal_x
-        self.goal_pos[env_ids, 1] = goal_y
-        self.goal_pos[env_ids, 2] = goal_z
+    def _get_object_pos(self) -> torch.Tensor:
+        """Return the cube root position in environment-local coordinates."""
+        return wp.to_torch(self.cube.data.root_pos_w) - self.scene.env_origins
+
+    def _get_grasp_pos(self) -> torch.Tensor:
+        """Return the Franka grasp frame in environment-local coordinates."""
+        hand_pos = wp.to_torch(self.robot.data.body_pos_w)[:, self.ee_body_idx]
+        hand_quat = wp.to_torch(self.robot.data.body_quat_w)[:, self.ee_body_idx]
+        grasp_offset = quat_apply(hand_quat, self.grasp_frame_offset.unsqueeze(0).expand(hand_quat.shape[0], -1))
+        return hand_pos + grasp_offset - self.scene.env_origins
+
+    def _get_finger_positions(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return left and right fingertip positions in environment-local coordinates."""
+        body_pos = wp.to_torch(self.robot.data.body_pos_w)
+        body_quat = wp.to_torch(self.robot.data.body_quat_w)
+        left_finger_pos = body_pos[:, self.lf_body_idx] + quat_apply(
+            body_quat[:, self.lf_body_idx],
+            self.finger_contact_offset.unsqueeze(0).expand(body_quat.shape[0], -1),
+        )
+        right_finger_pos = body_pos[:, self.rf_body_idx] + quat_apply(
+            body_quat[:, self.rf_body_idx],
+            self.finger_contact_offset.unsqueeze(0).expand(body_quat.shape[0], -1),
+        )
+        left_finger_pos -= self.scene.env_origins
+        right_finger_pos -= self.scene.env_origins
+        return left_finger_pos, right_finger_pos
+
+    def _get_finger_open_fraction(self, joint_pos: torch.Tensor) -> torch.Tensor:
+        """Return the mean normalized Franka finger opening in [0, 1]."""
+        finger_joint_pos = joint_pos[:, self.finger_joint_ids].mean(dim=-1)
+        return torch.clamp(
+            (finger_joint_pos - self.gripper_close_pos) / self._gripper_span,
+            min=0.0,
+            max=1.0,
+        )
+
+    def _compute_gripper_shaping(
+        self,
+        object_pos: torch.Tensor,
+        left_finger_pos: torch.Tensor,
+        right_finger_pos: torch.Tensor,
+        finger_joint_pos: torch.Tensor,
+        reach_dist: torch.Tensor,
+        lifted: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute gripper-specific shaping rewards for approach and grasp."""
+        finger_open_fraction = torch.clamp(
+            (finger_joint_pos - self.gripper_close_pos) / self._gripper_span,
+            0.0,
+            1.0,
+        )
+        near_object_gate = torch.sigmoid(
+            self.cfg.gripper_reward_sharpness * (self.cfg.gripper_reward_distance_thresh - reach_dist)
+        )
+        finger_midpoint = 0.5 * (left_finger_pos + right_finger_pos)
+        midpoint_dist = torch.linalg.norm(object_pos - finger_midpoint, dim=-1)
+        left_dist = torch.linalg.norm(object_pos - left_finger_pos, dim=-1)
+        right_dist = torch.linalg.norm(object_pos - right_finger_pos, dim=-1)
+        finger_height_err = 0.5 * (
+            torch.abs(left_finger_pos[:, 2] - object_pos[:, 2]) + torch.abs(right_finger_pos[:, 2] - object_pos[:, 2])
+        )
+
+        midpoint_reward = 1.0 - torch.tanh(midpoint_dist / self.cfg.grasp_midpoint_std)
+        balance_reward = torch.exp(-torch.abs(left_dist - right_dist) / self.cfg.grasp_balance_std)
+        finger_height_reward = 1.0 - torch.tanh(finger_height_err / self.cfg.grasp_finger_height_std)
+        grasp_pose_gate = near_object_gate * midpoint_reward * balance_reward * finger_height_reward
+
+        close_phase_gate = torch.sigmoid(
+            self.cfg.close_phase_sharpness * (grasp_pose_gate - self.cfg.close_phase_gate_thresh)
+        )
+        keep_open_gate = (1.0 - lifted) * (1.0 - close_phase_gate)
+
+        gripper_open_reward = keep_open_gate * finger_open_fraction
+        gripper_close_reward = 1.0 - finger_open_fraction
+        grasp_reward = grasp_pose_gate * (1.0 - finger_open_fraction)
+        premature_close_penalty = keep_open_gate * (1.0 - finger_open_fraction)
+        secure_grasp_gate = close_phase_gate * grasp_pose_gate * (1.0 - finger_open_fraction)
+
+        return (
+            gripper_open_reward,
+            gripper_close_reward,
+            grasp_reward,
+            premature_close_penalty,
+            secure_grasp_gate,
+            grasp_pose_gate,
+            finger_open_fraction,
+        )
+
+    def _compute_enclosure_gate(
+        self, object_pos: torch.Tensor, left_finger_pos: torch.Tensor, right_finger_pos: torch.Tensor
+    ) -> torch.Tensor:
+        """Estimate whether the cube lies between the open fingertips."""
+        finger_midpoint = 0.5 * (left_finger_pos + right_finger_pos)
+        finger_span = left_finger_pos - right_finger_pos
+        finger_span_norm = torch.linalg.norm(finger_span, dim=-1, keepdim=True)
+        finger_span_dir = finger_span / torch.clamp(finger_span_norm, min=1.0e-6)
+
+        object_offset = object_pos - finger_midpoint
+        span_offset = torch.abs(torch.sum(object_offset * finger_span_dir, dim=-1))
+        between_fingers_reward = 1.0 - torch.tanh(span_offset / self.cfg.enclosure_between_std)
+        span_ready_gate = torch.sigmoid(
+            self.cfg.enclosure_span_sharpness * (finger_span_norm.squeeze(-1) - self.cfg.enclosure_span_thresh)
+        )
+        return between_fingers_reward * span_ready_gate
+
+    def _compute_close_ready(
+        self,
+        reach_dist: torch.Tensor,
+        grasp_pose_gate: torch.Tensor,
+        enclosure_gate: torch.Tensor,
+        finger_open_fraction: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return whether the close phase is allowed to start."""
+        return (
+            (reach_dist <= self.cfg.approach_stage_reach_thresh)
+            & (grasp_pose_gate >= self.cfg.approach_stage_pose_thresh)
+            & (enclosure_gate >= self.cfg.approach_stage_enclosure_thresh)
+            & (finger_open_fraction >= self.cfg.approach_stage_open_fraction_thresh)
+        )
+
+    def _update_reward_stage(
+        self,
+        close_ready: torch.Tensor,
+        secure_grasp_gate: torch.Tensor,
+        lifted: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Advance the staged reward machine: approach -> close -> lift."""
+        ready_for_close = (self.reward_stage == 0) & close_ready
+        self.reward_stage = torch.where(ready_for_close, torch.ones_like(self.reward_stage), self.reward_stage)
+
+        ready_for_lift = (
+            (self.reward_stage == 1)
+            & ((secure_grasp_gate >= self.cfg.lift_stage_secure_grasp_thresh) | (lifted > 0.0))
+        )
+        self.reward_stage = torch.where(ready_for_lift, torch.full_like(self.reward_stage, 2), self.reward_stage)
+        return ready_for_close.float(), ready_for_lift.float()
+
+    def _compute_lift_progress_reward(self, object_pos: torch.Tensor, grasp_gate: torch.Tensor) -> torch.Tensor:
+        """Reward incremental cube lifting once the fingers likely secured the grasp."""
+        object_start_height = self.cube_default_root_pose[: object_pos.shape[0], 2].to(device=object_pos.device)
+        lifted_height = torch.clamp(object_pos[:, 2] - object_start_height, min=0.0)
+        return grasp_gate * torch.tanh(lifted_height / self.cfg.lift_progress_std)
+
+    def _compute_lift_upward_velocity_reward(self, grasp_gate: torch.Tensor) -> torch.Tensor:
+        """Reward upward cube motion after the gripper has secured the grasp."""
+        upward_velocity = torch.clamp(wp.to_torch(self.cube.data.root_lin_vel_w)[:, 2], min=0.0)
+        return grasp_gate * torch.tanh(upward_velocity / self.cfg.lift_upward_velocity_std)
+
+    def _compute_approach_shaping(
+        self,
+        grasp_pos: torch.Tensor,
+        hand_quat: torch.Tensor,
+        object_pos: torch.Tensor,
+        reach_dist: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reward approaching the cube from above with a vertical gripper."""
+        pregrasp_target = object_pos + grasp_pos.new_tensor((0.0, 0.0, self.cfg.pregrasp_height))
+        pregrasp_delta = grasp_pos - pregrasp_target
+        xy_dist = torch.linalg.norm(pregrasp_delta[:, :2], dim=-1)
+        z_err = torch.abs(pregrasp_delta[:, 2])
+
+        pregrasp_reward = (1.0 - torch.tanh(xy_dist / self.cfg.pregrasp_xy_std)) * (
+            1.0 - torch.tanh(z_err / self.cfg.pregrasp_z_std)
+        )
+        descend_gate = torch.sigmoid(
+            self.cfg.pregrasp_gate_sharpness * (self.cfg.pregrasp_xy_gate_thresh - xy_dist)
+        )
+        descend_reward = descend_gate * (1.0 - torch.tanh(reach_dist / self.cfg.descend_reach_std))
+        approach_reward = (1.0 - descend_gate) * pregrasp_reward + descend_gate * descend_reward
+
+        hand_to_grasp = quat_apply(hand_quat, self.grasp_frame_offset.unsqueeze(0).expand(hand_quat.shape[0], -1))
+        grasp_dir = hand_to_grasp / torch.clamp(torch.linalg.norm(hand_to_grasp, dim=-1, keepdim=True), min=1.0e-6)
+        top_down_alignment = torch.clamp(-grasp_dir[:, 2], 0.0, 1.0)
+        top_down_reward = descend_gate * top_down_alignment.square()
+        return approach_reward, top_down_reward, top_down_alignment
+
+    def _register_newton_contact_callback(self) -> None:
+        """Register a Newton-only callback to harden default shape contacts."""
+        self._newton_model_init_handle = None
+        physics_mgr_cls = self.sim.physics_manager
+        if physics_mgr_cls.__name__ != "NewtonManager":
+            return
+
+        self._newton_model_init_handle = physics_mgr_cls.register_callback(
+            self._apply_newton_contact_tuning,
+            PhysicsEvent.MODEL_INIT,
+            order=100,
+            name=f"{self.__class__.__name__}_newton_contact_tuning",
+        )
+
+    def _apply_newton_contact_tuning(self, _event) -> None:
+        """Apply task-local Newton and MuJoCo-solver contact parameters before model finalize."""
+        if not self.cfg.newton_contact.enabled:
+            return
+
+        physics_mgr_cls = self.sim.physics_manager
+        builder = getattr(physics_mgr_cls, "_builder", None)
+        if builder is None:
+            return
+
+        shape_cfg = builder.default_shape_cfg
+        if self.cfg.newton_contact.ke is not None:
+            shape_cfg.ke = self.cfg.newton_contact.ke
+        if self.cfg.newton_contact.kd is not None:
+            shape_cfg.kd = self.cfg.newton_contact.kd
+        if self.cfg.newton_contact.kf is not None:
+            shape_cfg.kf = self.cfg.newton_contact.kf
+        if self.cfg.newton_contact.mu is not None and hasattr(shape_cfg, "mu"):
+            shape_cfg.mu = self.cfg.newton_contact.mu
+        if self.cfg.newton_contact.contact_margin is not None:
+            shape_cfg.contact_margin = self.cfg.newton_contact.contact_margin
+        self._apply_mujoco_solver_contact_tuning(builder)
+
+    def _apply_mujoco_solver_contact_tuning(self, builder) -> None:
+        """Tune MuJoCo-solver contact attributes used by the Newton collision pipeline."""
+        from newton import solvers
+
+        solvers.SolverMuJoCo.register_custom_attributes(builder)
+        self._set_mujoco_custom_attribute_default(
+            builder,
+            "mujoco:geom_solimp",
+            self.cfg.newton_contact.geom_solimp,
+        )
+        self._set_mujoco_custom_attribute_default(
+            builder,
+            "mujoco:solimpfriction",
+            self.cfg.newton_contact.solimp_friction,
+        )
+        self._set_mujoco_custom_attribute_default(
+            builder,
+            "mujoco:solreffriction",
+            self.cfg.newton_contact.solref_friction,
+        )
+        self._append_support_contact_pairs(builder)
+        self._append_grasp_contact_pairs(builder)
+
+    @staticmethod
+    def _set_mujoco_custom_attribute_default(builder, key: str, value) -> None:
+        """Set a MuJoCo custom-attribute default if a task override is provided."""
+        if value is None:
+            return
+        builder.custom_attributes[key].default = list(value) if isinstance(value, tuple) else value
+
+    @staticmethod
+    def _matches_label(label: str, targets: tuple[str, ...]) -> bool:
+        """Return whether a prim/body label contains any target token."""
+        return any(target in label for target in targets)
+
+    def _append_support_contact_pairs(self, builder) -> None:
+        """Apply damped contact overrides for cube support contacts."""
+        cube_shapes, _, support_shapes = self._collect_contact_shape_groups(builder)
+        pair_keys: set[tuple[int, int, int]] = set()
+        for cube_shape in cube_shapes:
+            for support_shape in support_shapes:
+                self._append_mujoco_contact_pair(
+                    builder,
+                    shape_a=cube_shape,
+                    shape_b=support_shape,
+                    condim=self.cfg.newton_contact.support_pair_condim,
+                    friction=self.cfg.newton_contact.support_pair_friction,
+                    margin=self.cfg.newton_contact.support_pair_margin,
+                    solimp=self.cfg.newton_contact.support_pair_solimp,
+                    solref=self.cfg.newton_contact.support_pair_solref,
+                    pair_keys=pair_keys,
+                )
+
+    def _append_grasp_contact_pairs(self, builder) -> None:
+        """Apply damped contact overrides for fingertip grasp contacts."""
+        cube_shapes, finger_shapes, _ = self._collect_contact_shape_groups(builder)
+        pair_keys: set[tuple[int, int, int]] = set()
+        for finger_shape in finger_shapes:
+            for cube_shape in cube_shapes:
+                self._append_mujoco_contact_pair(
+                    builder,
+                    shape_a=finger_shape,
+                    shape_b=cube_shape,
+                    condim=self.cfg.newton_contact.grasp_pair_condim,
+                    friction=self.cfg.newton_contact.grasp_pair_friction,
+                    margin=self.cfg.newton_contact.grasp_pair_margin,
+                    solimp=self.cfg.newton_contact.grasp_pair_solimp,
+                    solref=self.cfg.newton_contact.grasp_pair_solref,
+                    pair_keys=pair_keys,
+                )
+
+    def _collect_contact_shape_groups(self, builder) -> tuple[list[int], list[int], list[int]]:
+        """Collect shape indices for the cube, fingers, and support surfaces."""
+        shape_labels = getattr(builder, "shape_label", None) or getattr(builder, "shape_key", None)
+        body_labels = getattr(builder, "body_label", None) or getattr(builder, "body_key", None)
+
+        cube_shapes: list[int] = []
+        finger_shapes: list[int] = []
+        support_shapes: list[int] = []
+
+        for shape_idx in range(builder.shape_count):
+            body_idx = int(builder.shape_body[shape_idx])
+            shape_label = str(shape_labels[shape_idx]).lower() if shape_labels is not None else ""
+            body_label = (
+                str(body_labels[body_idx]).lower()
+                if body_labels is not None and 0 <= body_idx < len(body_labels)
+                else ""
+            )
+
+            if self._matches_label(body_label, ("panda_leftfinger", "panda_rightfinger")):
+                finger_shapes.append(shape_idx)
+            elif self._matches_label(body_label, ("object",)):
+                cube_shapes.append(shape_idx)
+
+            if body_idx == -1 or self._matches_label(shape_label, ("/table", "/ground")) or self._matches_label(
+                body_label, ("table", "ground")
+            ):
+                support_shapes.append(shape_idx)
+
+        return cube_shapes, finger_shapes, support_shapes
+
+    def _append_mujoco_contact_pair(
+        self,
+        builder,
+        shape_a: int,
+        shape_b: int,
+        condim: int | None,
+        friction: tuple[float, float, float, float, float] | None,
+        margin: float | None,
+        solimp: tuple[float, float, float, float, float] | None,
+        solref: tuple[float, float] | None,
+        pair_keys: set[tuple[int, int, int]],
+    ) -> None:
+        """Append a MuJoCo contact-pair override for one shape pair."""
+        world_a = int(builder.shape_world[shape_a])
+        world_b = int(builder.shape_world[shape_b])
+        if world_a == world_b:
+            pair_world = world_a
+        elif world_a == -1:
+            pair_world = world_b
+        elif world_b == -1:
+            pair_world = world_a
+        else:
+            return
+
+        geom1, geom2 = sorted((shape_a, shape_b))
+        pair_key = (pair_world, geom1, geom2)
+        if pair_key in pair_keys:
+            return
+        pair_keys.add(pair_key)
+
+        attrs = builder.custom_attributes
+        attrs["mujoco:pair_world"].values.append(pair_world)
+        attrs["mujoco:pair_geom1"].values.append(geom1)
+        attrs["mujoco:pair_geom2"].values.append(geom2)
+        attrs["mujoco:pair_condim"].values.append(
+            condim if condim is not None else attrs["mujoco:pair_condim"].default
+        )
+        attrs["mujoco:pair_friction"].values.append(
+            list(friction) if friction is not None else attrs["mujoco:pair_friction"].default
+        )
+        attrs["mujoco:pair_gap"].values.append(attrs["mujoco:pair_gap"].default)
+        attrs["mujoco:pair_margin"].values.append(
+            margin if margin is not None else attrs["mujoco:pair_margin"].default
+        )
+        attrs["mujoco:pair_solimp"].values.append(
+            list(solimp) if solimp is not None else attrs["mujoco:pair_solimp"].default
+        )
+        attrs["mujoco:pair_solref"].values.append(
+            list(solref) if solref is not None else attrs["mujoco:pair_solref"].default
+        )
+        attrs["mujoco:pair_solreffriction"].values.append(attrs["mujoco:pair_solreffriction"].default)
